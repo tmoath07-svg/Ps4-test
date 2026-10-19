@@ -1,114 +1,170 @@
 name: Build PS4 PKG
-
-# يشتغل يدويًا من تبويب Actions (Run workflow) وكل ما ترفع تعديل على main
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-
+    branches:
+      - main
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install dependencies
         run: |
+          set -eux
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm curl jq tar unzip
-
-      - name: Download OpenOrbis toolchain (latest release)
+          sudo apt-get install -y \
+            clang lld llvm curl jq tar unzip make \
+            python3 build-essential
+      - name: Download OpenOrbis toolchain
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
+          set -eu
           mkdir -p "$HOME/ps4dev"
           cd "$HOME/ps4dev"
-
           API="https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest"
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" "$API" -o release.json
-
-          TAG=$(jq -r '.tag_name' release.json)
-          echo "Latest toolchain tag: $TAG"
-          echo "Assets:"; jq -r '.assets[].name' release.json
-
-          # نختار أول ملف ضغط ما هو لماك/ويندوز
-          URL=$(jq -r '.assets[].browser_download_url' release.json \
-                | grep -iE '(\.tar\.gz|\.zip)$' \
-                | grep -ivE 'mac|osx|win|exe|installer' | head -n1 || true)
-
-          # احتياط: الاسم القديم المعروف للأصل (v0.5.x.tar.gz)
-          if [ -z "$URL" ]; then
-            VER="${TAG#v}"
-            URL="https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/${TAG}/v${VER}.tar.gz"
-          fi
-          echo "Downloading: $URL"
-          curl -sL "$URL" -o toolchain_archive
-
-          case "$URL" in
-            *.zip)    unzip -q toolchain_archive ;;
-            *)        tar xzf toolchain_archive ;;
-          esac
-
-          # نلقى جذر الأدوات من مكان samples/hello_world
-          HW=$(find . -type d -path '*/samples/hello_world' | head -n1)
-          if [ -z "$HW" ]; then
-            echo "ERROR: samples/hello_world not found in toolchain archive"
-            find . -maxdepth 3 -type d | head -50
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "$API" \
+            -o release.json
+          TAG=$(jq -r '.tag_name // empty' release.json)
+          if [ -z "$TAG" ]; then
+            echo "ERROR: Could not find the latest release tag."
+            cat release.json
             exit 1
           fi
-          ROOT=$(realpath "${HW%/samples/hello_world}")
+          echo "Toolchain release: $TAG"
+          URL=$(jq -r '
+            [.assets[]
+            | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i"))
+            | select(.name | test("win|mac|osx"; "i") | not)
+            | .browser_download_url][0] // empty
+          ' release.json)
+          if [ -z "$URL" ]; then
+            echo "ERROR: No compatible archive found in release assets."
+            jq -r '.assets[] | .name' release.json
+            exit 1
+          fi
+          echo "Downloading: $URL"
+          curl -fL "$URL" -o toolchain_archive
+          mkdir -p extracted
+          case "$URL" in
+            *.zip)
+              unzip -q toolchain_archive -d extracted
+              ;;
+            *)
+              tar -xf toolchain_archive -C extracted
+              ;;
+          esac
+          echo "=== Extracted directories ==="
+          find extracted -maxdepth 4 -type d | head -100
+          ROOT=""
+          for candidate in \
+            "$HOME/ps4dev/extracted/OpenOrbis-PS4-Toolchain" \
+            "$HOME/ps4dev/extracted"
+          do
+            if [ -f "$candidate/Makefile" ] && \
+               [ -d "$candidate/samples/hello_world" ]; then
+              ROOT="$candidate"
+              break
+            fi
+          done
+          if [ -z "$ROOT" ]; then
+            HW=$(find "$HOME/ps4dev/extracted" \
+              -type d -path '*/samples/hello_world' \
+              -print -quit)
+            if [ -n "$HW" ]; then
+              ROOT="${HW%/samples/hello_world}"
+            fi
+          fi
+          if [ -z "$ROOT" ] || \
+             [ ! -d "$ROOT/samples/hello_world" ]; then
+            echo "ERROR: Could not locate the hello_world sample."
+            find "$HOME/ps4dev/extracted" -maxdepth 5 -type f | head -200
+            exit 1
+          fi
           echo "Toolchain root: $ROOT"
           echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
-
-          chmod -R +x "$ROOT"/bin/linux/* 2>/dev/null || true
-
-          # سكربت الإعداد للينكس (لو موجود)
-          SETUP=$(find "$ROOT" -name 'setup-toolchain.sh' | head -n1 || true)
-          if [ -n "$SETUP" ]; then
-            echo "Running $SETUP"
-            OO_PS4_TOOLCHAIN="$ROOT" bash "$SETUP" || echo "setup script failed (continuing)"
+          find "$ROOT" -maxdepth 3 -type f \
+            \( -name 'orbis-clang' \
+            -o -name 'orbis-ld' \
+            -o -name 'Makefile' \) -print
+      - name: Validate source
+        run: |
+          set -eu
+          if [ ! -f src/main.c ]; then
+            echo "ERROR: src/main.c does not exist."
+            find . -maxdepth 4 -type f | sort
+            exit 1
           fi
-
-      - name: Prepare project from the toolchain's hello_world sample
+          echo "=== main.c ==="
+          sed -n '1,240p' src/main.c
+      - name: Prepare project
         run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
+          set -eu
           rm -rf work
-          cp -r "$OO_PS4_TOOLCHAIN/samples/hello_world" work
-          cd work
-
-          # نشيل كود العينة ونحط كودنا
-          rm -f *.c *.cpp
-          cp ../src/main.c .
-
-          echo "----- Makefile (first 40 lines) -----"
-          head -40 Makefile
-          echo "-------------------------------------"
-
-          # معلومات التطبيق (CONTENT_ID لازم 36 حرف بالضبط)
-          sed -i 's/^TITLE[[:space:]]*:=.*/TITLE      := Xbox Controller Test/' Makefile
-          sed -i 's/^TITLE_ID[[:space:]]*:=.*/TITLE_ID   := XBRC00001/' Makefile
-          sed -i 's/^CONTENT_ID[[:space:]]*:=.*/CONTENT_ID := IV0000-XBRC00001_00-XBOXCTRLTEST0000/' Makefile
-
-          # المكتبات: اليد + المستخدم
-          sed -i 's/^LIBS[[:space:]]*:=.*/LIBS       := -lc -lkernel -lc++ -lScePad -lSceUserService/' Makefile
-
+          cp -R "$OO_PS4_TOOLCHAIN/samples/hello_world" work
+          echo "=== Original sample files ==="
+          find work -maxdepth 4 -type f | sort
+          echo "=== Original Makefile ==="
+          sed -n '1,180p' work/Makefile
+          echo "=== Source files ==="
+          find work -type f \
+            \( -name '*.c' -o -name '*.cpp' -o -name '*.o' \) \
+            -print
+          echo "=== Makefile build rules ==="
+          grep -nE '(^all:|^eboot\.bin:|\.o:|\.c\.o:|wildcard|SOURCES|OBJECTS|CC[[:space:]]*[:?+]?=|CFLAGS|TITLE|CONTENT_ID)' \
+            work/Makefile || true
+          echo "=== Project source ==="
+          cp src/main.c work/main.c
+          echo "=== Final source files ==="
+          find work -type f \
+            \( -name '*.c' -o -name '*.cpp' -o -name '*.o' \) \
+            -print
+          echo "=== Project Makefile ==="
+          sed -n '1,180p' work/Makefile
       - name: Build
+        working-directory: work
         run: |
-          cd "$GITHUB_WORKSPACE/work"
-          make
-
-      - name: Check PKG exists
+          set -eu
+          echo "=== Toolchain ==="
+          echo "$OO_PS4_TOOLCHAIN"
+          echo "=== Make dry run ==="
+          make -n
+          echo "=== Actual build ==="
+          make V=1
+      - name: Check build output
+        if: success()
+        working-directory: work
         run: |
-          cd "$GITHUB_WORKSPACE/work"
-          ls -la
-          ls *.pkg
-
+          set -eu
+          echo "=== Output files ==="
+          find . -maxdepth 5 -type f \
+            \( -name '*.pkg' -o -name 'eboot.bin' -o -name '*.elf' \) \
+            -print
+          PKG=$(find . -type f -name '*.pkg' -print -quit)
+          if [ -z "$PKG" ]; then
+            echo "ERROR: Build finished but no PKG was found."
+            exit 1
+          fi
+          echo "PKG found: $PKG"
       - name: Upload PKG
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: xbox-controller-test-pkg
-          path: work/*.pkg
+          path: work/**/*.pkg
+          if-no-files-found: error
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps4-build-diagnostics
+          path: |
+            work/Makefile
+            work/main.c
+          if-no-files-found: ignore
