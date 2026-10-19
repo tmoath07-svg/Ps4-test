@@ -12,74 +12,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl jq tar unzip make clang lld llvm
-      - name: Download OpenOrbis toolchain
-        run: |
-          set -eu
-          mkdir -p "$HOME/ps4dev"
-          cd "$HOME/ps4dev"
-          curl -fsSL \
-            https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
-            -o release.json
-          URL=$(jq -r '
-            [.assets[]
-            | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i"))
-            | select(.name | test("win|mac|osx"; "i") | not)
-            | .browser_download_url][0] // empty
-          ' release.json)
-          if [ -z "$URL" ]; then
-            echo "No compatible toolchain archive found."
-            jq -r '.assets[].name' release.json
-            exit 1
-          fi
-          curl -fL "$URL" -o archive
-          mkdir extracted
-          case "$URL" in
-            *.zip) unzip -q archive -d extracted ;;
-            *) tar -xf archive -C extracted ;;
-          esac
-          HW=$(find "$HOME/ps4dev/extracted" \
-            -type d -path '*/samples/hello_world' -print -quit)
-          if [ -z "$HW" ]; then
-            echo "hello_world sample not found."
-            exit 1
-          fi
-          ROOT="${HW%/samples/hello_world}"
-          echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
-          find "$ROOT/bin/linux" -maxdepth 1 -type f \
-            -exec chmod +x {} \;
-      - name: Prepare project
-        run: |
-          set -eu
-          test -f src/main.c
-          rm -rf work
-          cp -R "$OO_PS4_TOOLCHAIN/samples/hello_world" work
-          cp src/main.c work/main.c
-          cd work
-          sed -i 's/^TITLE[[:space:]]*:=.*/TITLE       := Xbox Controller Test/' Makefile
-          sed -i 's/^TITLE_ID[[:space:]]*:=.*/TITLE_ID    := XBRC00001/' Makefile
-          sed -i 's|^CONTENT_ID[[:space:]]*:=.*|CONTENT_ID  := IV0000-XBRC00001_00-XBOXCTRLTEST0000|' Makefile
-          sed -i 's|^LIBS[[:space:]]*:=.*|LIBS        := -lc -lkernel -lc++ -lScePad -lSceUserService|' Makefile
-      - name: Build and package
-        run: |
-          set -eu
-          # مهم: شغّل make من المجلد الأب،
-          # لأن مسارات Makefile تبدأ باسم مجلد المشروع.
-          make -C "$GITHUB_WORKSPACE" -f work/Makefile
-          echo "=== Build output ==="
-          find work -type f \
-            \( -name '*.pkg' -o -name 'eboot.bin' \) -print
-          PKG=$(find work -maxdepth 1 -type f -name '*.pkg' -print -quit)
-          if [ -z "$PKG" ]; then
-            echo "PKG was not generated."
-            exit 1
-          fi
-      - name: Upload PKG
+      - name: Build PS4 application
+        uses: OpenOrbis/toolchain-action@main
+        with:
+          version: v0.5.1
+          command: |
+            set -eu
+            test -f src/main.c
+            cp src/main.c hello_world/main.c
+            cd hello_world
+            make
+            PkgTool.Core pkg_build pkg/pkg.gp4 .
+      - name: Upload build files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xbox-controller-test-pkg
-          path: work/*.pkg
-          if-no-files-found: error
+          name: ps4-build-results
+          path: |
+            hello_world/**/*.pkg
+            hello_world/**/*.elf
+            hello_world/**/*.bin
+          if-no-files-found: ignore
