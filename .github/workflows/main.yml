@@ -1,35 +1,100 @@
 name: Build PS4 PKG
+
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Build PS4 application
-        uses: OpenOrbis/toolchain-action@main
-        with:
-          version: v0.5.1
-          command: |
-            set -eu
-            test -f src/main.c
-            cp src/main.c hello_world/main.c
-            cd hello_world
-            make
-            PkgTool.Core pkg_build pkg/pkg.gp4 .
-      - name: Upload build files
-        if: always()
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm curl jq tar unzip make build-essential
+
+      - name: Download OpenOrbis toolchain
+        run: |
+          set -eu
+
+          mkdir -p "$HOME/ps4dev"
+          cd "$HOME/ps4dev"
+
+          curl -fsSL \
+            https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
+            -o release.json
+
+          URL=$(jq -r '
+            [.assets[]
+            | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i"))
+            | select(.name | test("win|mac|osx"; "i") | not)
+            | .browser_download_url][0] // empty
+          ' release.json)
+
+          if [ -z "$URL" ]; then
+            echo "ERROR: No compatible toolchain archive found."
+            jq -r '.assets[].name' release.json
+            exit 1
+          fi
+
+          curl -fL "$URL" -o archive
+          mkdir extracted
+
+          case "$URL" in
+            *.zip) unzip -q archive -d extracted ;;
+            *) tar -xf archive -C extracted ;;
+          esac
+
+          HW=$(find "$HOME/ps4dev/extracted" \
+            -type d -path '*/samples/hello_world' -print -quit)
+
+          if [ -z "$HW" ]; then
+            echo "ERROR: hello_world sample not found."
+            exit 1
+          fi
+
+          ROOT="${HW%/samples/hello_world}"
+          echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Prepare project
+        run: |
+          set -eu
+
+          test -f src/main.c
+
+          mkdir -p work
+          cp -R "$OO_PS4_TOOLCHAIN/samples/hello_world" work/hello_world
+
+          # Makefile expects the C source inside this nested directory.
+          cp src/main.c work/hello_world/hello_world/main.c
+
+          # Give the application a recognizable title.
+          sed -i \
+            's/^TITLE[[:space:]]*:=[[:space:]].*/TITLE       := PS4 Controller Test/' \
+            work/hello_world/Makefile
+
+          echo "=== Source file ==="
+          ls -l work/hello_world/hello_world/main.c
+
+      - name: Build PKG
+        working-directory: work/hello_world
+        run: |
+          set -eux
+          make
+          test -f IV0000-BREW00083_00-HELLOWORLD000000.pkg
+
+      - name: Upload PS4 PKG
         uses: actions/upload-artifact@v4
         with:
-          name: ps4-build-results
-          path: |
-            hello_world/**/*.pkg
-            hello_world/**/*.elf
-            hello_world/**/*.bin
-          if-no-files-found: ignore
+          name: PS4-Controller-Test
+          path: work/hello_world/IV0000-BREW00083_00-HELLOWORLD000000.pkg
+          if-no-files-found: error
