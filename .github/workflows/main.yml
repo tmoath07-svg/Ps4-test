@@ -16,9 +16,7 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y \
-            clang lld llvm curl jq tar unzip make \
-            python3 build-essential
+          sudo apt-get install -y clang lld llvm curl jq tar unzip make build-essential
       - name: Download OpenOrbis toolchain
         env:
           GH_TOKEN: ${{ github.token }}
@@ -26,18 +24,10 @@ jobs:
           set -eu
           mkdir -p "$HOME/ps4dev"
           cd "$HOME/ps4dev"
-          API="https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest"
           curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
-            "$API" \
+            https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
             -o release.json
-          TAG=$(jq -r '.tag_name // empty' release.json)
-          if [ -z "$TAG" ]; then
-            echo "ERROR: Could not find the latest release tag."
-            cat release.json
-            exit 1
-          fi
-          echo "Toolchain release: $TAG"
           URL=$(jq -r '
             [.assets[]
             | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i"))
@@ -45,126 +35,64 @@ jobs:
             | .browser_download_url][0] // empty
           ' release.json)
           if [ -z "$URL" ]; then
-            echo "ERROR: No compatible archive found in release assets."
-            jq -r '.assets[] | .name' release.json
+            echo "ERROR: No compatible toolchain archive found."
+            jq -r '.assets[].name' release.json
             exit 1
           fi
-          echo "Downloading: $URL"
-          curl -fL "$URL" -o toolchain_archive
+          curl -fL "$URL" -o archive
           mkdir -p extracted
           case "$URL" in
-            *.zip)
-              unzip -q toolchain_archive -d extracted
-              ;;
-            *)
-              tar -xf toolchain_archive -C extracted
-              ;;
+            *.zip) unzip -q archive -d extracted ;;
+            *) tar -xf archive -C extracted ;;
           esac
-          echo "=== Extracted directories ==="
-          find extracted -maxdepth 4 -type d | head -100
-          ROOT=""
-          for candidate in \
-            "$HOME/ps4dev/extracted/OpenOrbis-PS4-Toolchain" \
-            "$HOME/ps4dev/extracted"
-          do
-            if [ -f "$candidate/Makefile" ] && \
-               [ -d "$candidate/samples/hello_world" ]; then
-              ROOT="$candidate"
-              break
-            fi
-          done
-          if [ -z "$ROOT" ]; then
-            HW=$(find "$HOME/ps4dev/extracted" \
-              -type d -path '*/samples/hello_world' \
-              -print -quit)
-            if [ -n "$HW" ]; then
-              ROOT="${HW%/samples/hello_world}"
-            fi
-          fi
-          if [ -z "$ROOT" ] || \
-             [ ! -d "$ROOT/samples/hello_world" ]; then
-            echo "ERROR: Could not locate the hello_world sample."
-            find "$HOME/ps4dev/extracted" -maxdepth 5 -type f | head -200
+          HW=$(find "$HOME/ps4dev/extracted" \
+            -type d -path '*/samples/hello_world' -print -quit)
+          if [ -z "$HW" ]; then
+            echo "ERROR: hello_world sample not found."
+            find extracted -maxdepth 5 -type f | head -100
             exit 1
           fi
-          echo "Toolchain root: $ROOT"
+          ROOT="${HW%/samples/hello_world}"
           echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
-          find "$ROOT" -maxdepth 3 -type f \
-            \( -name 'orbis-clang' \
-            -o -name 'orbis-ld' \
-            -o -name 'Makefile' \) -print
-      - name: Validate source
-        run: |
-          set -eu
-          if [ ! -f src/main.c ]; then
-            echo "ERROR: src/main.c does not exist."
-            find . -maxdepth 4 -type f | sort
-            exit 1
-          fi
-          echo "=== main.c ==="
-          sed -n '1,240p' src/main.c
+          echo "=== Compiler files ==="
+          find "$ROOT" -maxdepth 4 -type f \
+            \( -iname '*clang*' -o -iname '*gcc*' -o -iname '*makefile*' \) \
+            | head -100
       - name: Prepare project
         run: |
           set -eu
+          test -f src/main.c
           rm -rf work
           cp -R "$OO_PS4_TOOLCHAIN/samples/hello_world" work
-          echo "=== Original sample files ==="
-          find work -maxdepth 4 -type f | sort
-          echo "=== Original Makefile ==="
+          echo "=== Sample Makefile ==="
           sed -n '1,180p' work/Makefile
           echo "=== Source files ==="
           find work -type f \
             \( -name '*.c' -o -name '*.cpp' -o -name '*.o' \) \
             -print
-          echo "=== Makefile build rules ==="
-          grep -nE '(^all:|^eboot\.bin:|\.o:|\.c\.o:|wildcard|SOURCES|OBJECTS|CC[[:space:]]*[:?+]?=|CFLAGS|TITLE|CONTENT_ID)' \
-            work/Makefile || true
-          echo "=== Project source ==="
           cp src/main.c work/main.c
-          echo "=== Final source files ==="
-          find work -type f \
-            \( -name '*.c' -o -name '*.cpp' -o -name '*.o' \) \
+          echo "=== Toolchain compiler candidates ==="
+          find "$OO_PS4_TOOLCHAIN" -type f \
+            \( -name 'orbis-clang' -o -name 'orbis-clang++' \) \
             -print
-          echo "=== Project Makefile ==="
-          sed -n '1,180p' work/Makefile
-      - name: Build
+      - name: Diagnose build rules
         working-directory: work
         run: |
           set -eu
-          echo "=== Toolchain ==="
-          echo "$OO_PS4_TOOLCHAIN"
-          echo "=== Make dry run ==="
+          echo "=== Makefile variables and rules ==="
+          grep -nE \
+            '(^all:|^eboot\.bin:|\.o:|\.c\.o:|SOURCES|OBJECTS|CC[[:space:]]*[:?+]?=|CFLAGS|TITLE|CONTENT_ID|clang)' \
+            Makefile || true
+          echo "=== Dry run ==="
           make -n
-          echo "=== Actual build ==="
-          make V=1
-      - name: Check build output
-        if: success()
-        working-directory: work
+          echo "=== Source files ==="
+          find . -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.o' \) -print
+          echo "=== Compiler availability ==="
+          command -v clang || true
+          clang --version
+      - name: Stop until compiler rules are verified
         run: |
-          set -eu
-          echo "=== Output files ==="
-          find . -maxdepth 5 -type f \
-            \( -name '*.pkg' -o -name 'eboot.bin' -o -name '*.elf' \) \
-            -print
-          PKG=$(find . -type f -name '*.pkg' -print -quit)
-          if [ -z "$PKG" ]; then
-            echo "ERROR: Build finished but no PKG was found."
-            exit 1
-          fi
-          echo "PKG found: $PKG"
-      - name: Upload PKG
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xbox-controller-test-pkg
-          path: work/**/*.pkg
-          if-no-files-found: error
-      - name: Upload build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ps4-build-diagnostics
-          path: |
-            work/Makefile
-            work/main.c
-          if-no-files-found: ignore
+          echo "Diagnostic build completed."
+          echo "The sample Makefile has no working object compilation rule."
+          echo "Compiler and Makefile output are available in the Actions log."
+          exit 1
